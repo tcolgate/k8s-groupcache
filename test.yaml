@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-groupcache
+  labels:
+    app: k8s-groupcache
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: k8s-groupcache
+  template:
+    metadata:
+      labels:
+        app: k8s-groupcache
+    spec:
+      containers:
+      - name: k8s-groupcache
+        image: k8s-groupcache:latest
+        ports:
+        - containerPort: 8080
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: k8s-groupcache
+spec:
+  selector:
+    app: k8s-groupcache
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080
+
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  namespace: default
+  name: endpoints-reader
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: endpoints-reader-binding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+roleRef:
+  kind: Role
+  name: endpoints-reader
+  apiGroup: rbac.authorization.k8s.io

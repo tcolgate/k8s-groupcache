@@ -25,16 +25,15 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"go.opencensus.io/examples/exporter"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/trace"
 	"go.opencensus.io/zpages"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/golang/groupcache"
@@ -47,7 +46,7 @@ var (
 	port        = flag.String("peer.port", "8080", "port to listen on")
 	path        = flag.String("peer.path", "/", "scheme")
 	peerName    = flag.String("peer.self", "", "name of self, if not set defaults to hostname")
-	serviceName = flag.String("peer.service", "", "the kube service for the group")
+	serviceName = flag.String("peer.service", "k8s-groupcache", "the kube service for the group")
 	serviceNS   = flag.String("peer.serviceNS", "default", "the kube service for the group")
 	cacheBane   = flag.String("cache.name", "group", "the name of the group to start")
 	cacheSize   = flag.Int64("cache.byts", 64<<20, "size of the cache, in bytes")
@@ -77,43 +76,40 @@ func main() {
 		log.Fatalf("failed building kube client, %v", err)
 	}
 
-	sinf := informers.NewSharedInformerFactoryWithOptions(clientset, 1*time.Minute,
-		informers.WithNamespace(""),
-		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			opts.FieldSelector = fmt.Sprintf(".metadata.name=%s", *serviceName)
-			return
-		}),
-	)
+	peers := groupcache.NewHTTPPool(fmt.Sprintf("%s://%s:%s%s", *scheme, self, *port, *path))
 
-	peers := groupcache.NewHTTPPool(fmt.Sprintf("%s://%s:%s/%s", *scheme, self, *port, *path))
-
-	addEndpoint := func(updated interface{}) {
-		peers.Set()
-	}
-
-	deleteEndpoint := func(updated interface{}) {
-		peers.Set()
-	}
-
-	updateEndpoint := func(old, new interface{}) {
-		peers.Set()
-	}
-
-	epsInf := sinf.Core().V1().Endpoints().Informer()
-	epsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    addEndpoint,
-		UpdateFunc: updateEndpoint,
-		DeleteFunc: deleteEndpoint,
+	fsel := fields.OneTermEqualSelector("metadata.name", *serviceName).String()
+	log.Printf("attempted to watch, %v", fsel)
+	watcher, err := clientset.CoreV1().Endpoints(*serviceNS).Watch(metav1.ListOptions{
+		FieldSelector: fsel,
 	})
-
-	stopCh := make(chan struct{})
-	epsInf.Run(stopCh)
-
-	// Wait for the caches to be synced before starting workers
-	log.Print("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, epsInf.HasSynced); !ok {
-		log.Fatalf("failed to wait for caches to sync")
+	if err != nil {
+		log.Fatalf("failed watching endpoints, %v", err)
 	}
+
+	go func() {
+		ch := watcher.ResultChan()
+		for event := range ch {
+			ep, ok := event.Object.(*v1.Endpoints)
+			if !ok {
+				log.Printf("unexpected type %T", ep)
+			}
+			var ps []string
+			for _, s := range ep.Subsets {
+				for _, a := range s.Addresses {
+					ps = append(ps, fmt.Sprintf(
+						"%s://%s.%s:%s%s",
+						*scheme,
+						a.TargetRef.Name,
+						a.TargetRef.Namespace,
+						*port,
+						*path))
+				}
+			}
+			log.Printf("setting peers %#v", ps)
+			peers.Set(ps...)
+		}
+	}()
 
 	loadTime := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace:   "groupcache",
